@@ -12,8 +12,12 @@ import json
 import sqlite3
 import os
 import time
+import asyncio
+import random
 
+# run with ./env/bin/uvicorn main:app --reload
 MAX_LOBBY = 50
+MAX_PLAYERS = 4
 app = FastAPI()
 conn = sqlite3.connect("test.db", isolation_level=None, check_same_thread=False)
 cur = conn.cursor()
@@ -29,21 +33,7 @@ cur.execute("CREATE TABLE " \
   "state TEXT" \
   ");"
 )
-# max lobbies
-# is some % of system RAM
 
-# everytime a player accidentally disconnects or reloads the browser while 
-# the game is ongoing, the saved state of the game should load from sqlite
-# there should be no desyncs - db update should succeed only if websocket msg send 
-# succeeds and vice versa. 
-
-# websockets
-# msg send broadcast to everyone in the same chat
-
-# dead simple, forget about the history based MM for now
-# request to vote mechanism should exist
-
-# Load HTML from file at initialization
 def load_html():
     try:
         with open("chat.html", "r") as file:
@@ -60,6 +50,24 @@ class LobbyMemory:
     connections: List[WebSocket]
     players: set[str]
     message_history: List[Tuple[str, str, int]]
+    max_players: int = MAX_PLAYERS
+    # if max_players == len(players) and vote_requests > len(players)/2 proceed to voting
+    vote_requests: int = 0
+    voted_players: set[str] = None
+    # Voting phase management
+    voting_active: bool = False
+    voting_timer_task: asyncio.Task = None
+    player_votes: Dict[str, str] = None  # who voted for whom
+    vote_counts: Dict[str, int] = None  # vote count per player
+    ai_player: str = None  # the actual AI player (randomly chosen)
+
+    def __post_init__(self):
+        if self.voted_players is None:
+            self.voted_players = set()
+        if self.player_votes is None:
+            self.player_votes = {}
+        if self.vote_counts is None:
+            self.vote_counts = {}
 
 class ConnectionManager:
     def __init__(self):
@@ -140,10 +148,123 @@ class ConnectionManager:
             })
 
             print(msg_data)
-            
+
             # Broadcast to all connections
             for connection in self.lobbies[lobby_id].connections:
                 await connection.send_text(msg_data)
+
+    async def broadcast_vote_update(self, lobby_id: str, vote_count: int):
+        """Broadcast updated vote count to all clients in the lobby"""
+        if lobby_id in self.lobbies:
+            msg_data = json.dumps({
+                "type": "vote_update",
+                "votes": vote_count
+            })
+
+            # Broadcast to all connections
+            for connection in self.lobbies[lobby_id].connections:
+                await connection.send_text(msg_data)
+    
+    async def start_voting_phase(self, lobby_id: str):
+        """Start the voting phase with timer"""
+        if lobby_id not in self.lobbies:
+            return
+        
+        lobby = self.lobbies[lobby_id]
+        lobby.voting_active = True
+        # Initialize vote counts for all players
+        lobby.vote_counts = {player: 0 for player in lobby.players}
+        # Randomly select the AI player
+        lobby.ai_player = random.choice(list(lobby.players))
+        
+        # Broadcast voting phase start
+        msg_data = json.dumps({
+            "type": "voting_phase_start",
+            "players": list(lobby.players),
+            "vote_time": 10
+        })
+        for connection in lobby.connections:
+            await connection.send_text(msg_data)
+        
+        # Start the voting timer
+        lobby.voting_timer_task = asyncio.create_task(self.voting_timer(lobby_id))
+    
+    async def voting_timer(self, lobby_id: str):
+        """Handle the voting phase timer and reveal"""
+        # 10 second voting phase
+        await asyncio.sleep(10)
+        
+        if lobby_id not in self.lobbies:
+            return
+        
+        lobby = self.lobbies[lobby_id]
+        lobby.voting_active = False
+        
+        # Find the player with most votes
+        most_voted = None
+        if lobby.vote_counts:
+            max_votes = max(lobby.vote_counts.values())
+            tied_players = [p for p, v in lobby.vote_counts.items() if v == max_votes]
+            
+            # Special case: if AI is tied, AI wins
+            if lobby.ai_player in tied_players:
+                most_voted = lobby.ai_player
+            else:
+                # Otherwise, pick first player with max votes
+                most_voted = tied_players[0] if tied_players else None
+        
+        # Broadcast voting end and most voted player
+        msg_data = json.dumps({
+            "type": "voting_phase_end",
+            "most_voted": most_voted,
+            "vote_counts": lobby.vote_counts
+        })
+        for connection in lobby.connections:
+            await connection.send_text(msg_data)
+        
+        # 3 second delay before revealing AI
+        await asyncio.sleep(3)
+        
+        # Reveal the actual AI
+        msg_data = json.dumps({
+            "type": "ai_reveal",
+            "ai_player": lobby.ai_player
+        })
+        for connection in lobby.connections:
+            await connection.send_text(msg_data)
+        
+        # Reset voting state
+        lobby.vote_requests = 0
+        lobby.voted_players = set()
+        lobby.player_votes = {}
+        lobby.vote_counts = {}
+    
+    async def cast_vote(self, lobby_id: str, voter: str, target: str):
+        """Handle a player casting a vote"""
+        if lobby_id not in self.lobbies:
+            return
+        
+        lobby = self.lobbies[lobby_id]
+        if not lobby.voting_active or voter not in lobby.players or target not in lobby.players:
+            return
+        
+        # Check if voter already voted
+        if voter in lobby.player_votes:
+            old_target = lobby.player_votes[voter]
+            if old_target in lobby.vote_counts:
+                lobby.vote_counts[old_target] -= 1
+        
+        # Record the vote
+        lobby.player_votes[voter] = target
+        lobby.vote_counts[target] = lobby.vote_counts.get(target, 0) + 1
+        
+        # Broadcast updated vote counts
+        msg_data = json.dumps({
+            "type": "vote_count_update",
+            "vote_counts": lobby.vote_counts
+        })
+        for connection in lobby.connections:
+            await connection.send_text(msg_data)
 
 class User(BaseModel):
   username: str
@@ -167,11 +288,48 @@ async def websocket_endpoint(websocket: WebSocket, lobby_id: str, player_id: str
     try:
         while True:
             data = await websocket.receive_text()
-            # broadcast message from this player to all in the lobby
-            await manager.broadcast(lobby_id, data, player_id=player_id)
+
+            # Parse the incoming message
+            try:
+                msg_data = json.loads(data)
+                msg_type = msg_data.get('type')
+            except json.JSONDecodeError:
+                # If not JSON, treat as regular message
+                msg_type = 'message'
+
+            if msg_type == 'vote_request':
+                # Handle vote request
+                if lobby_id in manager.lobbies:
+                    lobby = manager.lobbies[lobby_id]
+                    # Check if player has already voted
+                    if player_id in lobby.voted_players:
+                        # Player already voted, send private message
+                        await manager.send_personal_message(
+                            json.dumps({"type": "system", "message": "You have already voted!"}),
+                            websocket
+                        )
+                    else:
+                        # First time voting
+                        lobby.voted_players.add(player_id)
+                        lobby.vote_requests += 1
+                        vote_count = lobby.vote_requests
+                        # Broadcast vote request notification to all players
+                        await manager.broadcast(lobby_id, f"{player_id} requested a vote", player_id="system")
+                        await manager.broadcast_vote_update(lobby_id, vote_count)
+                        
+                        # Start voting phase if we have 2+ vote requests
+                        if vote_count >= 2 and not lobby.voting_active:
+                            await manager.start_voting_phase(lobby_id)
+            elif msg_type == 'cast_vote':
+                # Handle vote casting during voting phase
+                target = msg_data.get('target')
+                if target:
+                    await manager.cast_vote(lobby_id, player_id, target)
+            else:
+                # broadcast message from this player to all in the lobby
+                message_content = msg_data.get('content', data)
+                await manager.broadcast(lobby_id, message_content, player_id=player_id)
     except WebSocketDisconnect:
-        # Remove player from database
-    
         # Disconnect from manager
         await manager.disconnect(websocket, lobby_id, player_id)
         
@@ -181,7 +339,6 @@ async def websocket_endpoint(websocket: WebSocket, lobby_id: str, player_id: str
 # user join new game and enters matchmaking queue
 # oauth is a pain but should be figured out later
 # for now assume all users use the same username always
-
 @app.post("/join_game")
 async def join_game():
     username = generate_username()

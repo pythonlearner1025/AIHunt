@@ -97,6 +97,11 @@
       color: #6b7280;
       font-size: 13px;
     }
+    .msg.chat-system {
+      text-align: center;
+      color: #789922;
+      font-size: 13px;
+    }
 
     /* ---------- Composer ---------- */
     .composer {
@@ -159,6 +164,93 @@
       cursor: pointer;
     }
     #joinBtn:hover { background: #0b1220; }
+
+    /* ---------- Voting Popup ---------- */
+    #votingOverlay {
+      position: fixed;
+      inset: 0;
+      display: none;
+      place-items: center;
+      background: rgba(0,0,0,0.7);
+      backdrop-filter: blur(4px);
+      z-index: 1000;
+    }
+    #votingOverlay.show { display: grid; }
+    
+    #votingCard {
+      background: #fff;
+      border: 2px solid #333;
+      border-radius: 16px;
+      padding: 24px;
+      width: min(500px, 90vw);
+      box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+    }
+    
+    #votingTimer {
+      font-size: 24px;
+      font-weight: 700;
+      text-align: center;
+      margin-bottom: 20px;
+      color: #111;
+    }
+    
+    .voting-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 16px;
+    }
+    
+    .vote-square {
+      border: 2px solid #d1d5db;
+      border-radius: 12px;
+      padding: 20px;
+      background: #f9fafb;
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.2s;
+    }
+    .vote-square:hover {
+      background: #e5e7eb;
+      border-color: #9ca3af;
+      transform: scale(1.02);
+    }
+    .vote-square.voted {
+      background: #dbeafe;
+      border-color: #3b82f6;
+    }
+    .vote-square.highlight-red {
+      border-color: #dc2626 !important;
+      color: #dc2626 !important;
+      border-width: 3px;
+      animation: pulse-red 0.5s ease-in-out;
+    }
+    .vote-square.highlight-green {
+      border-color: #16a34a !important;
+      color: #16a34a !important;
+      border-width: 3px;
+      animation: pulse-green 0.5s ease-in-out;
+    }
+    
+    .player-name {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .vote-count {
+      font-size: 20px;
+      font-weight: 700;
+      color: #374151;
+    }
+    
+    @keyframes pulse-red {
+      0%, 100% { background: #fee2e2; }
+      50% { background: #fecaca; }
+    }
+    @keyframes pulse-green {
+      0%, 100% { background: #dcfce7; }
+      50% { background: #bbf7d0; }
+    }
   </style>
 </head>
 <body>
@@ -171,7 +263,9 @@
     <!-- Lobby strip (optional; hidden once the game actually starts) -->
     <section id="lobbyStrip" hidden>
       <div style="font-weight:600;margin-bottom:6px;">Lobby</div>
-      <div id="playersCount">0/4</div>
+      Players: <div id="playersCount" style="display: inline;">0/4</div>
+      <br>
+      Votes: <div id="votesCount" style="display: inline;">0/2</div>
       <ul id="players" style="margin-top:6px;color:#6b7280;padding-left:16px;"></ul>
     </section>
 
@@ -191,6 +285,15 @@
           <div style="font-weight:700;">Join Game</div>
           <div style="font-size:13px;color:#6b7280;">Connect to the lobby and start chatting.</div>
           <button id="joinBtn" type="button">Join</button>
+        </div>
+      </div>
+
+      <!-- Voting overlay -->
+      <div id="votingOverlay">
+        <div id="votingCard">
+          <div id="votingTimer">10s</div>
+          <div style="text-align:center;font-weight:600;margin-bottom:8px;">Vote for the AI</div>
+          <div class="voting-grid" id="votingGrid"></div>
         </div>
       </div>
     </main>
@@ -219,6 +322,9 @@
       if (system) {
         li.className = 'msg system';
         li.textContent = text;
+      } else if (sender === 'system') {
+        li.className = 'msg chat-system';
+        li.textContent = text;
       } else {
         li.className = 'msg';
         li.innerHTML = `
@@ -243,10 +349,14 @@
     const lobbyStrip = document.getElementById('lobbyStrip');
     const playersCount = document.getElementById('playersCount');
     const playersList = document.getElementById('players');
+    const votesCount = document.getElementById('votesCount');
     const idContent = document.getElementById('idContent');
 
     let ws = null;
     let joined = false;
+    let votingActive = false;
+    let votingTimer = null;
+    let votedFor = null;
 
     document.getElementById('joinBtn').addEventListener('click', joinGame);
     document.getElementById('composer').addEventListener('submit', sendMessage);
@@ -299,6 +409,19 @@
           const ps = msg.players || [];
           playersCount.textContent = `${ps.length}/4`;
           playersList.innerHTML = ps.map(p => `<li>${p}</li>`).join('');
+        } else if (msg.type === 'vote_update') {
+          const voteCount = msg.votes || 0;
+          votesCount.textContent = `${voteCount}/2`;
+        } else if (msg.type === 'system') {
+          appendMessage({ system: true, text: msg.message });
+        } else if (msg.type === 'voting_phase_start') {
+          startVoting(msg.players, msg.vote_time);
+        } else if (msg.type === 'vote_count_update') {
+          updateVoteCounts(msg.vote_counts);
+        } else if (msg.type === 'voting_phase_end') {
+          endVoting(msg.most_voted);
+        } else if (msg.type === 'ai_reveal') {
+          revealAI(msg.ai_player);
         }
       };
     }
@@ -308,16 +431,119 @@
       const input = document.getElementById('messageText');
       const value = input.value.trim();
       if (!value) return;
+      
+      const data = value === "/vote"
+        ? { type: 'vote_request', content: true }  // This will increment vote count and update the Lobby span
+        : { type: 'message', content: value };
 
-      const ts = Math.floor(Date.now() / 1000);
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(value);
+        ws.send(JSON.stringify(data));
       } else {
-        // Fallback local echo so the UI still behaves offline.
-        appendMessage({ sender: 'Me', text: value, ts });
+        appendMessage({ sender: 'Me', text: value, ts: Math.floor(Date.now() / 1000) });
       }
+      
       input.value = '';
       requestAnimationFrame(() => { paneEl.scrollTop = paneEl.scrollHeight; });
+    }
+
+
+    // Voting phase functions
+    function startVoting(players, voteTime) {
+      votingActive = true;
+      votedFor = null;
+      const overlay = document.getElementById('votingOverlay');
+      const grid = document.getElementById('votingGrid');
+      const timerEl = document.getElementById('votingTimer');
+      
+      // Clear previous content
+      grid.innerHTML = '';
+      
+      // Create voting squares for each player (max 4 for 2x2 grid)
+      players.slice(0, 4).forEach(player => {
+        const square = document.createElement('div');
+        square.className = 'vote-square';
+        square.dataset.player = player;
+        square.innerHTML = `
+          <div class="player-name">${player}</div>
+          <div class="vote-count" data-player="${player}">0</div>
+        `;
+        square.addEventListener('click', () => castVote(player));
+        grid.appendChild(square);
+      });
+      
+      // Show overlay
+      overlay.classList.add('show');
+      
+      // Start countdown timer
+      let timeLeft = voteTime;
+      timerEl.textContent = `${timeLeft}s`;
+      votingTimer = setInterval(() => {
+        timeLeft--;
+        timerEl.textContent = `${timeLeft}s`;
+        if (timeLeft <= 0) {
+          clearInterval(votingTimer);
+        }
+      }, 1000);
+    }
+    
+    function castVote(player) {
+      if (!votingActive || !ws || ws.readyState !== WebSocket.OPEN) return;
+      
+      // Update UI to show selection
+      document.querySelectorAll('.vote-square').forEach(sq => {
+        sq.classList.remove('voted');
+      });
+      const square = document.querySelector(`.vote-square[data-player="${player}"]`);
+      if (square) square.classList.add('voted');
+      
+      votedFor = player;
+      
+      // Send vote to server
+      ws.send(JSON.stringify({
+        type: 'cast_vote',
+        target: player
+      }));
+    }
+    
+    function updateVoteCounts(voteCounts) {
+      Object.entries(voteCounts).forEach(([player, count]) => {
+        const countEl = document.querySelector(`.vote-count[data-player="${player}"]`);
+        if (countEl) countEl.textContent = count;
+      });
+    }
+    
+    function endVoting(mostVoted) {
+      votingActive = false;
+      clearInterval(votingTimer);
+      
+      // Highlight the most voted player in red
+      if (mostVoted) {
+        const square = document.querySelector(`.vote-square[data-player="${mostVoted}"]`);
+        if (square) {
+          square.classList.add('highlight-red');
+        }
+      }
+    }
+    
+    function revealAI(aiPlayer) {
+      // Remove red highlights
+      document.querySelectorAll('.vote-square').forEach(sq => {
+        sq.classList.remove('highlight-red');
+      });
+      
+      // Highlight the AI player in green
+      if (aiPlayer) {
+        const square = document.querySelector(`.vote-square[data-player="${aiPlayer}"]`);
+        if (square) {
+          square.classList.add('highlight-green');
+        }
+      }
+      
+      // Hide overlay after a delay
+      setTimeout(() => {
+        document.getElementById('votingOverlay').classList.remove('show');
+        document.getElementById('votingGrid').innerHTML = '';
+      }, 2000);
     }
 
     // Demo: render a system message so the pane isn't empty before join
