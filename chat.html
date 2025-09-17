@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AI Among Us — Chat</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    /* ---------- Reset / Base ---------- */
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font: 15px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      color: #111;
+      background: #fff;
+      /* Own the viewport and stop body from scrolling; inner pane will scroll */
+      min-height: 100vh;    /* fallback */
+      min-height: 100svh;   /* small viewport (iOS toolbars visible) */
+      min-height: 100dvh;   /* dynamic viewport (preferred) */
+      overflow: hidden;
+    }
+
+    /* ---------- App Shell ---------- */
+    .app {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      /* Allow the middle pane to actually shrink/scroll */
+      min-height: 0;
+    }
+
+    .app-header {
+      flex: 0 0 auto;
+      border-bottom: 1px solid #e5e5e5;
+      background: #fafafa;
+      padding: 12px 16px;
+    }
+    .app-title { font-weight: 700; font-size: 18px; margin: 0 0 4px; }
+    .app-sub { font-size: 12px; color: #6b7280; }
+
+    /* Optional tiny lobby strip (hidden once joined) */
+    #lobbyStrip {
+      flex: 0 0 auto;
+      border-bottom: 1px solid #f0f0f0;
+      padding: 10px 16px;
+      background: #fff;
+    }
+
+    /* ---------- Chat Column ---------- */
+    .chat {
+      /* Fill the rest of the viewport */
+      flex: 1 1 auto;
+      min-height: 0; /* critical for scroll containers inside flex */
+      display: flex;
+      flex-direction: column;
+      /* Prevent scroll chaining to body */
+      overscroll-behavior: contain;
+    }
+
+    .messages {
+      flex: 1 1 auto;
+      min-height: 0;               /* critical */
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 16px;
+      scroll-behavior: smooth;
+      -webkit-overflow-scrolling: touch; /* momentum on iOS */
+      scrollbar-gutter: stable both-edges;
+      background: #f9fafb;
+    }
+
+    .msg-list { list-style: none; margin: 0; padding: 0; }
+
+    .msg {
+      margin: 10px 0;
+      max-width: 900px; /* content line-length; not the layout width */
+    }
+    .msg .meta {
+      font-size: 12px;
+      color: #6b7280;
+      margin-bottom: 4px;
+    }
+    .msg .sender { font-weight: 600; color: #111; margin-right: 8px; }
+    .msg .time { color: #9ca3af; }
+    .msg .text {
+      font-size: 15px;
+      color: #111;
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 10px 12px;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+    .msg.system {
+      text-align: center;
+      color: #6b7280;
+      font-size: 13px;
+    }
+
+    /* ---------- Composer ---------- */
+    .composer {
+      flex: 0 0 auto;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      padding: 12px 16px;
+      border-top: 1px solid #e5e5e5;
+      background: #fafafa;
+      /* Respect notches / home indicator on mobile */
+      padding-bottom: calc(12px + env(safe-area-inset-bottom));
+    }
+    .input {
+      flex: 1;
+      min-width: 0; /* allow shrinking in flex */
+      border: 1px solid #d1d5db;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 15px;
+      outline: none;
+    }
+    .input:focus { border-color: #9ca3af; }
+    .send {
+      border: none;
+      border-radius: 10px;
+      padding: 10px 16px;
+      background: #111827;
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .send:hover { background: #0b1220; }
+
+    /* ---------- Join Overlay ---------- */
+    #joinOverlay {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: rgba(255,255,255,0.92);
+      backdrop-filter: blur(2px);
+    }
+    #joinCard {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 20px;
+      width: min(520px, 92vw);
+      display: grid;
+      gap: 12px;
+    }
+    #joinBtn {
+      padding: 10px 16px;
+      border: none;
+      border-radius: 10px;
+      background: #111827;
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    #joinBtn:hover { background: #0b1220; }
+  </style>
+</head>
+<body>
+  <div class="app" id="app">
+    <header class="app-header">
+      <h1 class="app-title">AI Among Us</h1>
+      <div class="app-sub">Your name: <span id="idContent">—</span></div>
+    </header>
+
+    <!-- Lobby strip (optional; hidden once the game actually starts) -->
+    <section id="lobbyStrip" hidden>
+      <div style="font-weight:600;margin-bottom:6px;">Lobby</div>
+      <div id="playersCount">0/4</div>
+      <ul id="players" style="margin-top:6px;color:#6b7280;padding-left:16px;"></ul>
+    </section>
+
+    <main class="chat">
+      <div class="messages" id="messagesPane">
+        <ul class="msg-list" id="messages"></ul>
+      </div>
+
+      <form class="composer" id="composer" autocomplete="off">
+        <input class="input" id="messageText" type="text" placeholder="Type a message…" />
+        <button class="send" id="sendBtn" type="submit">Send</button>
+      </form>
+
+      <!-- Join overlay -->
+      <div id="joinOverlay">
+        <div id="joinCard">
+          <div style="font-weight:700;">Join Game</div>
+          <div style="font-size:13px;color:#6b7280;">Connect to the lobby and start chatting.</div>
+          <button id="joinBtn" type="button">Join</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    // ---- Utilities ----
+    const messagesEl = document.getElementById('messages');
+    const paneEl = document.getElementById('messagesPane');
+
+    function fmt(tsSec) {
+      const d = new Date(tsSec * 1000);
+      const h = d.getHours();
+      const m = String(d.getMinutes()).padStart(2, '0');
+      const a = h >= 12 ? 'PM' : 'AM';
+      const hh = h % 12 || 12;
+      return `${hh}:${m} ${a}`;
+    }
+
+    function nearBottom(container, threshold = 96) {
+      return container.scrollHeight - container.scrollTop - container.clientHeight < threshold;
+    }
+
+    function appendMessage({ sender, text, ts, system = false }) {
+      const li = document.createElement('li');
+      if (system) {
+        li.className = 'msg system';
+        li.textContent = text;
+      } else {
+        li.className = 'msg';
+        li.innerHTML = `
+          <div class="meta"><span class="sender">${sender}</span><span class="time">${fmt(ts)}</span></div>
+          <div class="text"></div>`;
+        li.querySelector('.text').textContent = text;
+      }
+      const stick = nearBottom(paneEl);
+      messagesEl.appendChild(li);
+      if (stick) requestAnimationFrame(() => { paneEl.scrollTop = paneEl.scrollHeight; });
+    }
+
+    // Keep pinned to bottom across resizes if the user was already at bottom
+    (function keepPinned() {
+      let pinned = true;
+      paneEl.addEventListener('scroll', () => { pinned = nearBottom(paneEl); }, { passive: true });
+      window.addEventListener('resize', () => { if (pinned) paneEl.scrollTop = paneEl.scrollHeight; });
+    })();
+
+    // ---- Join / Lobby / WS wiring ----
+    const joinOverlay = document.getElementById('joinOverlay');
+    const lobbyStrip = document.getElementById('lobbyStrip');
+    const playersCount = document.getElementById('playersCount');
+    const playersList = document.getElementById('players');
+    const idContent = document.getElementById('idContent');
+
+    let ws = null;
+    let joined = false;
+
+    document.getElementById('joinBtn').addEventListener('click', joinGame);
+    document.getElementById('composer').addEventListener('submit', sendMessage);
+
+    async function joinGame() {
+      // Fetch join info
+      const res = await fetch('/join_game', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      const data = await res.json();
+      if (data.status !== 'ok') {
+        appendMessage({ system: true, text: 'Failed to join lobby.' });
+        return;
+      }
+
+      joined = true;
+      joinOverlay.style.display = 'none';
+      lobbyStrip.hidden = false;
+
+      idContent.textContent = data.player_id || 'unknown';
+
+      // Populate initial players list
+      const players = (data.players ? data.players.split(',') : []);
+      playersCount.textContent = `${players.length}/4`;
+      playersList.innerHTML = players.map(p => `<li>${p}</li>`).join('');
+
+      // Open WebSocket
+      const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+      const wsUrl = `${proto}://${location.host}/ws/${data.lobby_id}/${data.player_id}`;
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        appendMessage({ system: true, text: 'Connected to lobby.' });
+      };
+
+      ws.onclose = () => {
+        appendMessage({ system: true, text: 'Disconnected.' });
+      };
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'history' && Array.isArray(msg.messages)) {
+          // Load history and force bottom after initial batch
+          msg.messages.forEach(m => appendMessage({ sender: m.sender, text: m.message, ts: m.timestamp }));
+          requestAnimationFrame(() => { paneEl.scrollTop = paneEl.scrollHeight; });
+        } else if (msg.type === 'message') {
+          appendMessage({ sender: msg.sender, text: msg.message, ts: msg.timestamp });
+        } else if (msg.type === 'player_update') {
+          const ps = msg.players || [];
+          playersCount.textContent = `${ps.length}/4`;
+          playersList.innerHTML = ps.map(p => `<li>${p}</li>`).join('');
+        }
+      };
+    }
+
+    function sendMessage(e) {
+      e.preventDefault();
+      const input = document.getElementById('messageText');
+      const value = input.value.trim();
+      if (!value) return;
+
+      const ts = Math.floor(Date.now() / 1000);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(value);
+      } else {
+        // Fallback local echo so the UI still behaves offline.
+        appendMessage({ sender: 'Me', text: value, ts });
+      }
+      input.value = '';
+      requestAnimationFrame(() => { paneEl.scrollTop = paneEl.scrollHeight; });
+    }
+
+    // Demo: render a system message so the pane isn't empty before join
+    appendMessage({ system: true, text: 'Join the lobby to start chatting.' });
+  </script>
+</body>
+</html>
