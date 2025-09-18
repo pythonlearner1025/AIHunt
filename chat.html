@@ -125,6 +125,11 @@
       outline: none;
     }
     .input:focus { border-color: #9ca3af; }
+    .input:disabled {
+      background-color: #f3f4f6;
+      color: #9ca3af;
+      cursor: not-allowed;
+    }
     .send {
       border: none;
       border-radius: 10px;
@@ -133,8 +138,17 @@
       color: #fff;
       font-weight: 600;
       cursor: pointer;
+      transition: all 0.2s ease;
     }
     .send:hover { background: #0b1220; }
+    .send:disabled {
+      background: #9ca3af;
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+    .send:disabled:hover {
+      background: #9ca3af;
+    }
 
     /* ---------- Join Overlay ---------- */
     #joinOverlay {
@@ -357,10 +371,39 @@
     let votingActive = false;
     let votingTimer = null;
     let votedFor = null;
+    let currentPlayerCount = 0; // Track current player count
 
     document.getElementById('joinBtn').addEventListener('click', joinGame);
     document.getElementById('composer').addEventListener('submit', sendMessage);
 
+    // Function to update message input state based on player count
+    function updateMessageInputState() {
+      const messageInput = document.getElementById('messageText');
+      const sendButton = document.getElementById('sendBtn');
+      const isGameReady = currentPlayerCount >= 4;
+      
+      if (isGameReady) {
+        // Enable messaging when 4+ players
+        messageInput.disabled = false;
+        sendButton.disabled = false;
+        messageInput.placeholder = "Type a message…";
+        messageInput.style.backgroundColor = "";
+        messageInput.style.color = "";
+        sendButton.style.opacity = "";
+        sendButton.style.cursor = "";
+      } else {
+        // Disable messaging when < 4 players
+        messageInput.disabled = true;
+        sendButton.disabled = true;
+        messageInput.placeholder = `Waiting for ${4 - currentPlayerCount} more player${4 - currentPlayerCount === 1 ? '' : 's'} to join...`;
+        messageInput.style.backgroundColor = "#f3f4f6";
+        messageInput.style.color = "#9ca3af";
+        sendButton.style.opacity = "0.5";
+        sendButton.style.cursor = "not-allowed";
+      }
+    }
+
+    // Do not display who joined
     async function joinGame() {
       // Fetch join info
       const res = await fetch('/join_game', {
@@ -381,8 +424,12 @@
 
       // Populate initial players list
       const players = (data.players ? data.players.split(',') : []);
+      currentPlayerCount = players.length;
       playersCount.textContent = `${players.length}/4`;
-      playersList.innerHTML = players.map(p => `<li>${p}</li>`).join('');
+      //playersList.innerHTML = players.map(p => `<li>${p}</li>`).join('');
+      
+      // Update message input state based on initial player count
+      updateMessageInputState();
 
       // Open WebSocket
       const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
@@ -407,8 +454,14 @@
           appendMessage({ sender: msg.sender, text: msg.message, ts: msg.timestamp });
         } else if (msg.type === 'player_update') {
           const ps = msg.players || [];
+          currentPlayerCount = ps.length;
           playersCount.textContent = `${ps.length}/4`;
-          playersList.innerHTML = ps.map(p => `<li>${p}</li>`).join('');
+          if (ps.length == 4) {
+            playersList.innerHTML = ps.map(p => `<li>${p}</li>`).join('');
+          }
+          
+          // Update message input state when player count changes
+          updateMessageInputState();
         } else if (msg.type === 'vote_update') {
           const voteCount = msg.votes || 0;
           votesCount.textContent = `${voteCount}/2`;
@@ -428,6 +481,12 @@
 
     function sendMessage(e) {
       e.preventDefault();
+      
+      // Prevent sending messages if game isn't ready (< 4 players)
+      if (currentPlayerCount < 4) {
+        return;
+      }
+      
       const input = document.getElementById('messageText');
       const value = input.value.trim();
       if (!value) return;
@@ -445,7 +504,6 @@
       input.value = '';
       requestAnimationFrame(() => { paneEl.scrollTop = paneEl.scrollHeight; });
     }
-
 
     // Voting phase functions
     function startVoting(players, voteTime) {
@@ -548,6 +606,9 @@
 
     // Demo: render a system message so the pane isn't empty before join
     appendMessage({ system: true, text: 'Join the lobby to start chatting.' });
+    
+    // Initialize message input state (disabled until 4 players join)
+    updateMessageInputState();
   </script>
 </body>
 </html>

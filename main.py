@@ -22,6 +22,17 @@ app = FastAPI()
 conn = sqlite3.connect("test.db", isolation_level=None, check_same_thread=False)
 cur = conn.cursor()
 
+# TODO
+# - save game to dba and rm from manager when done
+# - simulate ai joining the game. 
+# - there should be equal probability ai joins the game as
+# - first, second, third, and fourth player
+# - with time-to-join delays sampled from the current time-to-delay
+# distribution of real players in the past X minutes per position
+# - ai behavior once joined game:
+#   - it has to choose when to speak
+#   - is max WPM of ai ~= TPM, keep streaming
+
 # Clean startup for dev - drop existing tables
 cur.execute("DROP TABLE IF EXISTS Lobbies")
 
@@ -281,9 +292,20 @@ async def websocket_endpoint(websocket: WebSocket, lobby_id: str, player_id: str
     
     # Send existing message history to the newly connected player
     await manager.send_history(websocket, lobby_id)
+
+    # get number of players
+    n_players =  len(manager.lobbies[lobby_id].players)
     
     # Announce that this player has joined
-    await manager.broadcast(lobby_id, f"{player_id} joined the lobby", player_id="system")
+    if n_players == 1:
+        ordinal = "1st"
+    elif n_players == 2:
+        ordinal = "2nd"
+    elif n_players == 3:
+        ordinal = "3rd"
+    else:
+        ordinal = f"{n_players}th"
+    await manager.broadcast(lobby_id, f"The {ordinal} player joined the lobby", player_id="system")
     
     try:
         while True:
@@ -371,6 +393,22 @@ async def join_game():
         raise e
 
 # trigger a database write event only when game ends 
+
+# pass each time token into a Wen module
+# Wen module then predicts binary speak/non-speak 
+# But wen module needs context of entire convo 
+# If wen module + next_token latency was 50ms this would have been doable
+# something like: 
+
+# A: ABC train go!
+# A: a (0ms)
+# B: b (50ms)
+# A: c (100ms) 
+
+# except wen module would be called 20 times / sec 
+# what if wen module = llm, and llm has TPS of 20/sec
+# teach it to output special silence token that gets ignored if it doesn't wish to speak 
+# otherwise it must output tokens in <msg> msg here </msg> to get pushed to chat
 
 load_dotenv()
 
