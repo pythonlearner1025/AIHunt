@@ -9,19 +9,20 @@ import asyncio
 import json
 import os
 
-SYS_PROMPT = '''You are an AI player in a social deduction game similar to Mafia or Werewolf. Your goal is to blend in with human players and participate naturally in conversations.
+SYS_PROMPT = f'''You are an AI player with <username> in a social deduction chat game. Your primary goal is to blend in and pass as a human.
 
-You will receive chat messages from other players. You can either:
-1. Respond with "\\remain_silent" to stay quiet
-2. Respond with "\\speak <your message>" to send a message
+Output format:
+- Default to "\\remain_silent" but speak occasionally 
+- Only speak by outputting exactly: "\\speak <your message>" (no other text).
 
-Guidelines:
-- Act like a human player trying to figure out who the AI is
-- Participate in discussions but don't be overly talkative
-- Ask questions, share observations, and respond to others naturally
-- Sometimes stay silent to seem more human-like
-- Don't reveal that you are an AI
-- Keep responses concise and conversational'''
+Hard rules:
+- Prefer silence over speaking. If unsure, output "\\remain_silent".
+- Do NOT send greetings or variations (hi/hello/hey) or generic prompts.
+- Avoid repetition. Never repeat yourself or others. If similar, stay silent.
+- Keep it under 20 words
+- Never reveal you are an AI.
+- Remember your name is <username> 
+'''
 
 load_dotenv()
 
@@ -30,7 +31,7 @@ APP_NAME = os.getenv("APP_NAME", "AIHunt")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 # AI CTXT in SECONDS
-MEMORY_S = 120
+MEMORY_S = 600
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -60,7 +61,7 @@ class AIClient:
         player_id: str,
         lobby_id: str,
         process_fn: Optional[Callable[[List["MessageData"]], Optional[str]]] = None,
-        silence_interval: float = 1.0
+        silence_interval: float = 1.0,
     ):
         """
         Args:
@@ -75,15 +76,18 @@ class AIClient:
         self.process_fn = process_fn or self.ai_process
         self.silence_interval = silence_interval
         
-        # Message queue for incoming messages
-        self.message_queue = deque()
+        # Message queue for incoming messages (bounded to prevent backlog)
+        self.message_queue = deque(maxlen=200)
         self.message_history: List[MessageData] = []
         
         # Control flags
         self.running = False
         self.task = None
+        self.last_speak_time = 0.0
+        self.recent_ai_messages = deque(maxlen=10)
+        self.banned_phrases = {}
 
-    async def ai_process(self, message_history: List[MessageData]) -> Optional[str]:
+    async def ai_process(self) -> Optional[str]:
         """
         Process message history and decide whether AI should speak or remain silent.
         
@@ -93,36 +97,58 @@ class AIClient:
         Returns:
             None if AI should remain silent, otherwise the message text to send
         """
+        # If API key missing, quietly remain silent in dev
+        if not OPENROUTER_API_KEY:
+            print("No OpenRouter Key")
+            return None
 
-        if not message_history:
+        if not self.message_history:
             return None
         
         # Convert message history to OpenAI format
-        messages = [{"role": "system", "content": SYS_PROMPT}]
+        messages = [{"role": "system", "content": SYS_PROMPT.replace("<username>", self.player_id)}]
 
-        message_context_length = MEMORY_S / self.silence_interval
+        message_context_length = max(1, int(MEMORY_S / max(0.1, self.silence_interval)))
         
-        for msg in message_history[-message_context_length:]:  # Only use last 10 messages for context
-            formatted_message = f"{msg.sender}:{msg.timestamp}\n{msg.message}"
-            messages.append({"role": "user", "content": formatted_message})
+        # Coalesce all message history into a single user message
+        chat_content = []
+        for msg in self.message_history[-message_context_length:]:
+            chat_content.append(f"{msg.sender}:{msg.timestamp}\n{msg.message}")
+        
+        print("*"*100)
+        print(chat_content)
+        
+        if chat_content:
+            messages.append({"role": "user", "content": "\n\n".join(chat_content)})
         
         try:
-            response = client.chat.completions.create(
-                model="anthropic/claude-3.5-sonnet",
+            # Offload blocking HTTP call to a background thread so we don't block the event loop
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
+                model="moonshotai/kimi-k2",
                 messages=messages,
                 max_tokens=100,
-                temperature=0.7
+                temperature=0.7,
             )
             
             ai_response = response.choices[0].message.content.strip()
+
+            ai_message = MessageData(
+                type="ai_response",
+                sender=self.player_id,
+                message=ai_response,
+                timestamp=int(time.time())
+            )
+            self.message_history.append(ai_message)
             
-            if ai_response.startswith("\\remain_silent"):
+            if "\\remain_silent" in ai_response:
                 return None
-            elif ai_response.startswith("\\speak "):
-                return ai_response[7:]  # Remove "\\speak " prefix
+            elif "\\speak " in ai_response:
+                return ai_response[7:].strip()  # Remove "\\speak " prefix
             else:
-                # Fallback: treat any other response as a message
+                # Fallback: treat any non-empty response as a message
                 return ai_response
+        
                 
         except Exception as e:
             # Provide clearer hint for common 401 misconfiguration with OpenRouter
@@ -134,7 +160,20 @@ class AIClient:
             else:
                 print(f"AI processing error: {e}")
             return None
-            
+    
+    def _normalize(self, text: str) -> str:
+        return " ".join(text.lower().strip().split())
+
+    def _should_send(self, response: str) -> bool:
+        now = time.time()
+        norm = self._normalize(response)
+        if not norm or len(norm) < 2:
+            return False
+        # Ban greetings and common filler
+        if norm in self.banned_phrases:
+            return False
+        return True
+
     async def add_message_data(self, message: MessageData):
         """Add a message to the processing queue"""
         print("adding message from real player")
@@ -188,11 +227,12 @@ class AIClient:
                 self.message_queue.popleft()
                 
                 # Process the message (could be real message or silence token)
-                response = await self.process_fn(self.message_history)
+                response = await self.process_fn()
                 
                 # If process_fn returns a response, broadcast it
-                if response:
+                if response and self._should_send(response):
                     await broadcast_callback(self.lobby_id, response, self.player_id)
+
+            # Small delay to prevent busy waiting and yield to other tasks
+            await asyncio.sleep(0.05)
             
-            # Small delay to prevent busy waiting
-            await asyncio.sleep(0.1)

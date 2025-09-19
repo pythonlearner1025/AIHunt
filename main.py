@@ -17,7 +17,7 @@ import random
 # run with ./env/bin/uvicorn main:app --reload
 MAX_LOBBY = 50
 MAX_PLAYERS = 4
-SILENCE_INTERVAL = 1.0
+SILENCE_INTERVAL = 5.0
 app = FastAPI()
 conn = sqlite3.connect("test.db", isolation_level=None, check_same_thread=False)
 cur = conn.cursor()
