@@ -1,6 +1,4 @@
 
-from openai import OpenAI
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse
@@ -8,11 +6,10 @@ from fastapi import WebSocket, WebSocketDisconnect
 from username_generator import generate_username
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
-from ai_client import AIClient, AIClientManager
+from ai_client import AIClient
 
 import json
 import sqlite3
-import os
 import time
 import asyncio
 import random
@@ -58,6 +55,13 @@ def load_html():
 
 # Load HTML at module initialization
 html_content = load_html()
+
+@dataclass 
+class MessageData:
+    type: str
+    sender: str
+    message: str
+    timestamp: int
 
 @dataclass
 class LobbyMemory:
@@ -109,9 +113,7 @@ class ConnectionManager:
 
         # create new lobby
         if lobby_id not in self.lobbies:
-            self.create_new_lobby_with_ai(lobby_id)
-
-        assert lobby_id in self.lobbies.keys()
+            await self.create_new_lobby_with_ai(lobby_id)
 
         self.lobbies[lobby_id].connections.append(websocket)
         self.lobbies[lobby_id].players.add(player_id)
@@ -165,7 +167,7 @@ class ConnectionManager:
             sender = player_id or "system"
             self.lobbies[lobby_id].message_history.append((sender, message, timestamp))
             
-            # Create JSON message
+            # Create MessageData object
             msg_data = json.dumps({
                 "type": "message",
                 "sender": sender,
@@ -177,9 +179,16 @@ class ConnectionManager:
             for connection in self.lobbies[lobby_id].connections:
                 await connection.send_text(msg_data)
             
+            # Create MessageData object for AI client
+            msg_data_obj = MessageData(
+                type="message",
+                sender=sender,
+                message=message,
+                timestamp=timestamp
+            )
             # AICLIENT add message to client if not self
             if player_id != self.lobbies[lobby_id].ai_player:
-                await self.lobbies[lobby_id].ai_client.add_message(msg_data)
+                await self.lobbies[lobby_id].ai_client.add_message_data(msg_data_obj)
     
     async def broadcast_player_update(self, lobby_id: str, players: List[str]):
         """Broadcast updated player list to all clients in the lobby"""
@@ -319,6 +328,7 @@ def get():
   
 @app.websocket("/ws/{lobby_id}/{player_id}")
 async def websocket_endpoint(websocket: WebSocket, lobby_id: str, player_id: str):
+    print(lobby_id)
     await manager.connect(websocket, lobby_id, player_id)
     
     # Send existing message history to the newly connected player
@@ -422,10 +432,10 @@ async def join_game():
             lobby_players.add(username)
             if len(lobby_players) == 4:
                 # braodcast new game start signal
-                manager.start_sig(lobby_id)
+                await manager.start_sig(lobby_id)
             players_str = ",".join(list(lobby_players))
         else:
-            lobby_id = len(manager.lobbies)
+            lobby_id = str(len(manager.lobbies))
             players_str = username
 
         return {"status": "ok", "lobby_id": lobby_id, "player_id": username, "players": players_str}
@@ -449,24 +459,3 @@ async def join_game():
 # what if wen module = llm, and llm has TPS of 20/sec
 # teach it to output special silence token that gets ignored if it doesn't wish to speak 
 # otherwise it must output tokens in <msg> msg here </msg> to get pushed to chat
-
-
-
-'''
-completion = client.chat.completions.create(
-  model="anthropic/claude-sonnet-4",
-  messages=[
-    {
-      "role": "system",
-      "content": SYS_PROMPT
-    },
-    {
-      "role": "user",
-      "content": "<mj> ok, so apparently one of us is ai. let's go around and ask a question, and have everyone else answer it. then at the end we vote. seems like a fair way to do it, no? </mj>"
-    }
-  ]
-)
-
-#print(completion.choices[0].message.content)
-
-'''
